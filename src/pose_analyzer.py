@@ -3,8 +3,11 @@
 import cv2
 import numpy as np
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -63,23 +66,33 @@ LANDMARK_NAMES = {
 }
 
 
+# 默认模型路径
+DEFAULT_MODEL_PATH = Path(__file__).parent.parent / "models" / "pose_landmarker_heavy.task"
+
+
 class PoseAnalyzer:
-    """使用 MediaPipe 进行姿态估计"""
+    """使用 MediaPipe PoseLandmarker 进行姿态估计"""
 
     def __init__(
         self,
-        static_image_mode: bool = False,
-        model_complexity: int = 2,  # 0, 1, 2 - 2 最精确
+        model_path: Optional[str] = None,
+        model_complexity: int = 2,  # 保留参数兼容性，但不再使用
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5
     ):
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=static_image_mode,
-            model_complexity=model_complexity,
-            min_detection_confidence=min_detection_confidence,
+        if model_path is None:
+            model_path = str(DEFAULT_MODEL_PATH)
+
+        # 创建 PoseLandmarker 选项
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            min_pose_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence
         )
+
+        self.detector = vision.PoseLandmarker.create_from_options(options)
 
     def analyze_frame(
         self,
@@ -101,28 +114,34 @@ class PoseAnalyzer:
         # 转换为 RGB（MediaPipe 要求）
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # 运行姿态估计
-        results = self.pose.process(rgb_frame)
+        # 创建 MediaPipe Image
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        if not results.pose_landmarks:
+        # 运行姿态估计
+        results = self.detector.detect(mp_image)
+
+        if not results.pose_landmarks or len(results.pose_landmarks) == 0:
             return None
+
+        # 取第一个检测到的人
+        pose_landmarks = results.pose_landmarks[0]
 
         # 提取关键点
         landmarks = {}
-        for idx, landmark in enumerate(results.pose_landmarks.landmark):
+        for idx, landmark in enumerate(pose_landmarks):
             name = LANDMARK_NAMES.get(idx, f"landmark_{idx}")
             landmarks[name] = PoseLandmark(
                 x=landmark.x,
                 y=landmark.y,
                 z=landmark.z,
-                visibility=landmark.visibility
+                visibility=landmark.visibility if hasattr(landmark, 'visibility') else 1.0
             )
 
         return PoseResult(
             frame_index=frame_index,
             timestamp=frame_index / fps,
             landmarks=landmarks,
-            raw_landmarks=results.pose_landmarks
+            raw_landmarks=pose_landmarks
         )
 
     def analyze_video(
@@ -157,7 +176,8 @@ class PoseAnalyzer:
 
     def close(self):
         """释放资源"""
-        self.pose.close()
+        if hasattr(self, 'detector'):
+            self.detector.close()
 
     def __enter__(self):
         return self

@@ -157,45 +157,115 @@ class SwingDetector:
         return positions
 
     def _find_top_position(self, wrist_positions: List[Dict]) -> int:
-        """找到挥杆顶点（手腕最高位置）"""
-        if not wrist_positions:
+        """
+        找到挥杆顶点（第一个显著的手腕高度峰值）
+
+        改进：不再找全局最高点，而是找第一个局部峰值，
+        这样可以正确区分上杆顶点和收杆位置。
+        """
+        if len(wrist_positions) < 5:
             return 0
 
-        # y 坐标最小的点（图像坐标系 y 向下）
-        min_y = float('inf')
-        top_idx = 0
+        # 提取 y 坐标序列（y 越小表示越高）
+        y_values = [pos["y"] for pos in wrist_positions]
 
-        for i, pos in enumerate(wrist_positions):
-            if pos["y"] < min_y:
-                min_y = pos["y"]
-                top_idx = i
+        # 简单平滑（移动平均）
+        window = 5
+        smoothed = []
+        for i in range(len(y_values)):
+            start = max(0, i - window // 2)
+            end = min(len(y_values), i + window // 2 + 1)
+            smoothed.append(np.mean(y_values[start:end]))
 
-        return top_idx
+        # 找所有局部最小值（即手腕最高点）
+        # 局部最小值：比前后都小
+        peaks = []
+        for i in range(2, len(smoothed) - 2):
+            if (smoothed[i] < smoothed[i-1] and
+                smoothed[i] < smoothed[i-2] and
+                smoothed[i] < smoothed[i+1] and
+                smoothed[i] < smoothed[i+2]):
+                # 计算峰值的显著性（与周围的差异）
+                prominence = min(
+                    max(smoothed[max(0,i-10):i]) - smoothed[i],
+                    max(smoothed[i+1:min(len(smoothed),i+11)]) - smoothed[i]
+                ) if i > 0 and i < len(smoothed) - 1 else 0
+                peaks.append((i, smoothed[i], prominence))
+
+        if not peaks:
+            # 如果没找到局部峰值，使用前半部分的最小值
+            half = len(smoothed) // 2
+            min_idx = 0
+            min_val = smoothed[0]
+            for i in range(half):
+                if smoothed[i] < min_val:
+                    min_val = smoothed[i]
+                    min_idx = i
+            return min_idx
+
+        # 找第一个显著的峰值（prominence > 0.05）
+        for idx, val, prominence in peaks:
+            if prominence > 0.03:  # 阈值可调
+                return idx
+
+        # 如果没有显著峰值，返回第一个峰值
+        return peaks[0][0]
 
     def _estimate_impact(
         self,
         wrist_positions: List[Dict],
         top_idx: int
     ) -> int:
-        """估计击球点（顶点之后手腕速度最快的点附近）"""
+        """
+        估计击球点
+
+        策略：顶点之后，手腕快速下降到接近初始高度的位置
+        （击球时手腕位置接近 setup 时的高度）
+        """
         if top_idx >= len(wrist_positions) - 1:
             return len(wrist_positions) - 1
 
-        # 计算顶点之后的手腕速度
-        max_speed = 0
-        impact_idx = top_idx + 1
+        # 获取初始手腕高度（setup 位置）
+        initial_y = wrist_positions[0]["y"]
 
-        for i in range(top_idx + 1, len(wrist_positions) - 1):
-            dx = wrist_positions[i + 1]["x"] - wrist_positions[i]["x"]
-            dy = wrist_positions[i + 1]["y"] - wrist_positions[i]["y"]
-            speed = np.sqrt(dx * dx + dy * dy)
+        # 从顶点之后开始，找手腕下降到接近初始高度的点
+        # 同时考虑下降速度
+        best_idx = top_idx + 1
+        best_score = float('inf')
 
-            # 找速度最大的点，作为击球点附近
-            if speed > max_speed:
-                max_speed = speed
-                impact_idx = i
+        # 限制搜索范围：顶点后的一段时间内
+        search_end = min(top_idx + len(wrist_positions) // 3, len(wrist_positions) - 1)
 
-        return impact_idx
+        for i in range(top_idx + 1, search_end):
+            current_y = wrist_positions[i]["y"]
+
+            # 计算与初始高度的差距
+            height_diff = abs(current_y - initial_y)
+
+            # 计算下降速度（从顶点到当前）
+            if i > top_idx:
+                dy = wrist_positions[i]["y"] - wrist_positions[i-1]["y"]
+                # 正的 dy 表示向下移动（y 坐标增加）
+
+                # 综合得分：接近初始高度 + 正在下降
+                if dy > 0:  # 手腕正在下降
+                    score = height_diff
+                    if score < best_score:
+                        best_score = score
+                        best_idx = i
+
+        # 如果没找到好的点，使用手腕速度最大的点
+        if best_score == float('inf'):
+            max_speed = 0
+            for i in range(top_idx + 1, search_end):
+                dx = wrist_positions[i]["x"] - wrist_positions[i-1]["x"]
+                dy = wrist_positions[i]["y"] - wrist_positions[i-1]["y"]
+                speed = np.sqrt(dx * dx + dy * dy)
+                if speed > max_speed:
+                    max_speed = speed
+                    best_idx = i
+
+        return best_idx
 
     def _find_backswing_start(
         self,
